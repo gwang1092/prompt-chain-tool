@@ -7,15 +7,6 @@ const DEFAULT_MODEL = 'gemini-3.8-flash'
 
 type ModelRow = { id: string; model_key: string; is_active: boolean }
 
-type StepResult = {
-    name: string
-    model: string
-    note: string | null
-    output: string | null
-    error: string | null
-    latencyMs: number
-}
-
 function render(template: string, vars: Record<string, string>) {
     return template.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => vars[key] ?? '')
 }
@@ -23,32 +14,50 @@ function render(template: string, vars: Record<string, string>) {
 async function callGemini(modelKey: string, parts: Record<string, unknown>[]) {
     const started = Date.now()
 
-    const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${modelKey}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts }] }),
+    try {
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelKey}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents: [{ parts }] }),
+                // Give up with a readable error instead of letting Vercel return a 504
+                signal: AbortSignal.timeout(50000),
+            }
+        )
+
+        const data = await response.json().catch(() => ({}))
+
+        const text = ((data?.candidates?.[0]?.content?.parts ?? []) as { text?: string; thought?: boolean }[])
+            .filter(p => typeof p.text === 'string' && !p.thought)
+            .map(p => p.text as string)
+            .join('')
+            .trim()
+
+        return {
+            ok: response.ok && text.length > 0,
+            text,
+            error:
+                (data?.error?.message as string | undefined) ??
+                (response.ok ? 'The model returned no text' : `Request failed (${response.status})`),
+            latency: Date.now() - started,
+            inputTokens: (data?.usageMetadata?.promptTokenCount as number | undefined) ?? null,
+            outputTokens: (data?.usageMetadata?.candidatesTokenCount as number | undefined) ?? null,
         }
-    )
-
-    const data = await response.json().catch(() => ({}))
-
-    const text = ((data?.candidates?.[0]?.content?.parts ?? []) as { text?: string; thought?: boolean }[])
-        .filter(p => typeof p.text === 'string' && !p.thought)
-        .map(p => p.text as string)
-        .join('')
-        .trim()
-
-    return {
-        ok: response.ok && text.length > 0,
-        text,
-        error:
-            (data?.error?.message as string | undefined) ??
-            (response.ok ? 'The model returned no text' : `Request failed (${response.status})`),
-        latency: Date.now() - started,
-        inputTokens: (data?.usageMetadata?.promptTokenCount as number | undefined) ?? null,
-        outputTokens: (data?.usageMetadata?.candidatesTokenCount as number | undefined) ?? null,
+    } catch (err) {
+        const timedOut = err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+        return {
+            ok: false,
+            text: '',
+            error: timedOut
+                ? 'The model took too long to respond (over 50 seconds). Try again.'
+                : err instanceof Error
+                    ? err.message
+                    : 'The request failed',
+            latency: Date.now() - started,
+            inputTokens: null,
+            outputTokens: null,
+        }
     }
 }
 
@@ -69,22 +78,33 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: 'Not authorized.' }, { status: 403 })
     }
 
-    let body: { chainId?: unknown; imageBase64?: unknown; hint?: unknown }
+    let body: {
+        chainId?: unknown
+        stepIndex?: unknown
+        previous?: unknown
+        imageBase64?: unknown
+        hint?: unknown
+    }
     try {
         body = await request.json()
     } catch {
         return NextResponse.json({ error: 'Bad request.' }, { status: 400 })
     }
 
-    if (typeof body.chainId !== 'string' || typeof body.imageBase64 !== 'string' || !body.imageBase64) {
-        return NextResponse.json({ error: 'Choose a photo first.' }, { status: 400 })
-    }
-    const chainId = body.chainId
-    const imageBase64 = body.imageBase64
+    const chainId = typeof body.chainId === 'string' ? body.chainId : ''
+    const stepIndex = typeof body.stepIndex === 'number' ? body.stepIndex : -1
+    const previous = typeof body.previous === 'string' ? body.previous : ''
+    const imageBase64 = typeof body.imageBase64 === 'string' ? body.imageBase64 : ''
     const hint = typeof body.hint === 'string' ? body.hint.trim() : ''
 
-    const [chainRes, stepsRes, modelsRes, termsRes, examplesRes] = await Promise.all([
-        supabase.from('prompt_chains').select('id, name').eq('id', chainId).single(),
+    if (!chainId || stepIndex < 0) {
+        return NextResponse.json({ error: 'Bad request.' }, { status: 400 })
+    }
+    if (stepIndex === 0 && !imageBase64) {
+        return NextResponse.json({ error: 'Choose a photo first.' }, { status: 400 })
+    }
+
+    const [stepsRes, modelsRes, termsRes, examplesRes] = await Promise.all([
         supabase
             .from('prompt_chain_steps')
             .select('step_order, name, instruction, model_id')
@@ -99,101 +119,56 @@ export async function POST(request: Request) {
             .limit(5),
     ])
 
-    const chain = chainRes.data
-    if (!chain) {
-        return NextResponse.json({ error: 'Chain not found.' }, { status: 404 })
-    }
-    const steps = stepsRes.data ?? []
-    if (!steps.length) {
-        return NextResponse.json({ error: 'This chain has no steps yet.' }, { status: 400 })
+    const step = (stepsRes.data ?? [])[stepIndex]
+    if (!step) {
+        return NextResponse.json({ error: 'That step no longer exists.' }, { status: 404 })
     }
 
+    // Work out which model this step uses
     const models = new Map(((modelsRes.data ?? []) as ModelRow[]).map(m => [m.id, m]))
+    const m = step.model_id ? models.get(step.model_id) : undefined
+    let modelKey = DEFAULT_MODEL
+    let note: string | null = null
+    if (step.model_id && !m) {
+        note = `That model no longer exists, so ${DEFAULT_MODEL} was used.`
+    } else if (m && !m.is_active) {
+        note = `${m.model_key} is inactive, so ${DEFAULT_MODEL} was used.`
+    } else if (m && !m.model_key.startsWith('gemini')) {
+        note = `${m.model_key} is not a Gemini model, so ${DEFAULT_MODEL} was used.`
+    } else if (m) {
+        modelKey = m.model_key
+    }
+
     const termsText =
         (termsRes.data ?? []).map(t => `- ${t.term}: ${t.definition}`).join('\n') || '(none)'
     const examplesText =
         (examplesRes.data ?? []).map(e => `- ${e.caption}`).join('\n') || '(none yet)'
 
-    const results: StepResult[] = []
-    const logs: Record<string, unknown>[] = []
-    let previous = ''
-    let failure = ''
-
-    for (const [index, step] of steps.entries()) {
-        // Work out which model this step uses
-        const m = step.model_id ? models.get(step.model_id) : undefined
-        let modelKey = DEFAULT_MODEL
-        let note: string | null = null
-        if (step.model_id && !m) {
-            note = `That model no longer exists, so ${DEFAULT_MODEL} was used.`
-        } else if (m && !m.is_active) {
-            note = `${m.model_key} is inactive, so ${DEFAULT_MODEL} was used.`
-        } else if (m && !m.model_key.startsWith('gemini')) {
-            note = `${m.model_key} is not a Gemini model, so ${DEFAULT_MODEL} was used.`
-        } else if (m) {
-            modelKey = m.model_key
-        }
-
-        const promptText = render(step.instruction, {
-            previous,
-            hint: hint || 'none',
-            terms: termsText,
-            examples: examplesText,
-        })
-
-        // Only the first step sees the photo
-        const parts: Record<string, unknown>[] = [{ text: promptText }]
-        if (index === 0) {
-            parts.push({ inline_data: { mime_type: 'image/jpeg', data: imageBase64 } })
-        }
-
-        const out = await callGemini(modelKey, parts)
-
-        results.push({
-            name: step.name,
-            model: modelKey,
-            note,
-            output: out.ok ? out.text : null,
-            error: out.ok ? null : out.error,
-            latencyMs: out.latency,
-        })
-        logs.push({
-            model_key: modelKey,
-            prompt_text: promptText,
-            response_text: out.ok ? out.text : null,
-            error_message: out.ok ? null : out.error,
-            latency_ms: out.latency,
-            input_tokens: out.inputTokens,
-            output_tokens: out.outputTokens,
-        })
-
-        if (!out.ok) {
-            failure = `Step ${index + 1} (${step.name}) failed: ${out.error}`
-            break
-        }
-        previous = out.text
-    }
-
-    // Log the run. A logging problem must not hide the results.
-    let requestId: string | null = null
-    const { data: logged, error: logError } = await supabase.rpc('log_generation', {
-        p_chain_id: chain.id,
-        p_hint: hint,
-        p_status: failure ? 'failed' : 'succeeded',
-        p_steps: logs,
+    const promptText = render(step.instruction, {
+        previous,
+        hint: hint || 'none',
+        terms: termsText,
+        examples: examplesText,
     })
-    if (logError) {
-        console.error('Could not log generation:', logError.message)
-    } else {
-        requestId = logged as string
+
+    // Only the first step sees the photo
+    const parts: Record<string, unknown>[] = [{ text: promptText }]
+    if (stepIndex === 0) {
+        parts.push({ inline_data: { mime_type: 'image/jpeg', data: imageBase64 } })
     }
+
+    const out = await callGemini(modelKey, parts)
 
     return NextResponse.json({
-        ok: !failure,
-        error: failure || null,
-        requestId,
-        chainName: chain.name,
-        steps: results,
-        finalOutput: failure ? '' : previous,
+        ok: out.ok,
+        error: out.ok ? null : out.error,
+        name: step.name,
+        model: modelKey,
+        note,
+        output: out.ok ? out.text : null,
+        latencyMs: out.latency,
+        promptText,
+        inputTokens: out.inputTokens,
+        outputTokens: out.outputTokens,
     })
 }

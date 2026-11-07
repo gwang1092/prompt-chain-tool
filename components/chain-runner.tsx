@@ -44,14 +44,17 @@ export default function ChainRunner({
                                         chainId,
                                         chainName,
                                         userId,
+                                        steps,
                                     }: {
     chainId: string
     chainName: string
     userId: string
+    steps: { name: string }[]
 }) {
     const [file, setFile] = useState<File | null>(null)
     const [hint, setHint] = useState('')
     const [running, setRunning] = useState(false)
+    const [progress, setProgress] = useState<number | null>(null)
     const [error, setError] = useState('')
     const [result, setResult] = useState<RunResult | null>(null)
     const [blob, setBlob] = useState<Blob | null>(null)
@@ -64,6 +67,7 @@ export default function ChainRunner({
         if (!file) return
 
         setRunning(true)
+        setProgress(0)
         setError('')
         setResult(null)
         setImageUrl('')
@@ -74,28 +78,98 @@ export default function ChainRunner({
             setBlob(shrunk)
             const imageBase64 = await blobToBase64(shrunk)
 
-            const res = await fetch('/api/run-chain', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chainId, imageBase64, hint }),
+            const done: StepResult[] = []
+            const logs: Record<string, unknown>[] = []
+            let previous = ''
+            let failure = ''
+
+            // One request per step keeps every request short
+            for (let i = 0; i < steps.length; i++) {
+                setProgress(i)
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                let data: any = {}
+                let status = 0
+                try {
+                    const res = await fetch('/api/run-chain', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            chainId,
+                            stepIndex: i,
+                            previous,
+                            hint,
+                            imageBase64: i === 0 ? imageBase64 : undefined,
+                        }),
+                    })
+                    status = res.status
+                    data = await res.json()
+                } catch {
+                    data = {
+                        error: `The server sent back something unexpected${status ? ` (status ${status})` : ''}.`,
+                    }
+                }
+
+                const ok = data.ok === true
+                const message = data.error ?? 'The step failed.'
+
+                done.push({
+                    name: data.name ?? steps[i].name,
+                    model: data.model ?? '',
+                    note: data.note ?? null,
+                    output: ok ? data.output : null,
+                    error: ok ? null : message,
+                    latencyMs: data.latencyMs ?? 0,
+                })
+                logs.push({
+                    model_key: data.model ?? null,
+                    prompt_text: data.promptText ?? null,
+                    response_text: ok ? data.output : null,
+                    error_message: ok ? null : message,
+                    latency_ms: data.latencyMs ?? null,
+                    input_tokens: data.inputTokens ?? null,
+                    output_tokens: data.outputTokens ?? null,
+                })
+
+                // Show each step as soon as it finishes
+                setResult({
+                    ok: false,
+                    error: null,
+                    requestId: null,
+                    chainName,
+                    steps: [...done],
+                    finalOutput: '',
+                })
+
+                if (!ok) {
+                    failure = `Step ${i + 1} (${steps[i].name}) failed: ${message}`
+                    break
+                }
+                previous = data.output
+            }
+
+            // Log the whole run once, at the end
+            const { data: requestId, error: logError } = await supabase.rpc('log_generation', {
+                p_chain_id: chainId,
+                p_hint: hint.trim(),
+                p_status: failure ? 'failed' : 'succeeded',
+                p_steps: logs,
             })
+            if (logError) console.error('Could not log generation:', logError.message)
 
-            let data: Partial<RunResult> & { error?: string | null } = {}
-            try {
-                data = await res.json()
-            } catch {
-                data = { error: `The server sent back something unexpected (status ${res.status}).` }
-            }
-
-            if (!res.ok) {
-                setError(data.error ?? 'The run failed.')
-                return
-            }
-            setResult(data as RunResult)
+            setResult({
+                ok: !failure,
+                error: failure || null,
+                requestId: logError ? null : (requestId as string),
+                chainName,
+                steps: done,
+                finalOutput: failure ? '' : previous,
+            })
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Something went wrong.')
         } finally {
             setRunning(false)
+            setProgress(null)
         }
     }
 
@@ -170,9 +244,9 @@ export default function ChainRunner({
                     {running ? 'Running the chain...' : `Run "${chainName}"`}
                 </button>
 
-                {running && (
+                {running && progress !== null && (
                     <p className="text-xs text-zinc-500">
-                        Each step runs in turn, so a long chain can take up to a minute.
+                        Running step {progress + 1} of {steps.length}: {steps[progress]?.name}...
                     </p>
                 )}
             </div>

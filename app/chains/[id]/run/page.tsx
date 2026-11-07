@@ -14,12 +14,16 @@ export default async function RunChainPage({
 
     const [chainRes, stepsRes] = await Promise.all([
         supabase.from('prompt_chains').select('id, name').eq('id', id).single(),
-        supabase.from('prompt_chain_steps').select('id', { count: 'exact', head: true }).eq('chain_id', id),
+        supabase
+            .from('prompt_chain_steps')
+            .select('name')
+            .eq('chain_id', id)
+            .order('step_order', { ascending: true }),
     ])
 
     const chain = chainRes.data
     if (!chain) notFound()
-    const stepCount = stepsRes.count ?? 0
+    const steps = stepsRes.data ?? []
 
     return (
         <AppShell name={profile.display_name ?? 'Admin'}>
@@ -30,11 +34,11 @@ export default async function RunChainPage({
                 Run: {chain.name}
             </h1>
             <p className="mb-6 text-sm text-zinc-600 dark:text-zinc-400">
-                {stepCount} {stepCount === 1 ? 'step' : 'steps'}. Every run is logged and appears in the
-                admin app&apos;s generation requests.
+                {steps.length} {steps.length === 1 ? 'step' : 'steps'}. Every run is logged and appears in
+                the admin app&apos;s generation requests.
             </p>
 
-            {stepCount === 0 ? (
+            {steps.length === 0 ? (
                 <p className="text-sm">
                     This chain has no steps yet.{' '}
                     <Link href={`/chains/${id}/steps/new`} className="font-semibold underline">
@@ -42,7 +46,7 @@ export default async function RunChainPage({
                     </Link>
                 </p>
             ) : (
-                <ChainRunner chainId={id} chainName={chain.name} userId={user.id} />
+                <ChainRunner chainId={id} chainName={chain.name} userId={user.id} steps={steps} />
             )}
         </AppShell>
     )
